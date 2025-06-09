@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Polygon Arbitrage Interface</title>
+  <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
+  <style>
+    body {
+      background-color: #001f2f;
+      color: white;
+      font-family: Arial, sans-serif;
+      padding: 20px;
+    }
+    input, button, select {
+      font-size: 16px;
+      margin: 10px 0;
+      padding: 10px;
+      width: 100%;
+    }
+    .large-display {
+      font-size: 24px;
+      margin: 20px 0;
+      background: #003f5f;
+      padding: 20px;
+      border-radius: 12px;
+    }
+    .profitable {
+      background: #006400 !important;
+      color: #00ff88;
+    }
+    .log, .sheet {
+      background: #002b40;
+      padding: 12px;
+      border-radius: 10px;
+      margin-top: 20px;
+      overflow-x: auto;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th, td {
+      border: 1px solid #444;
+      padding: 10px;
+      text-align: center;
+    }
+    a {
+      color: #00ccff;
+    }
+    #emissions {
+      max-height: 300px;
+      overflow-y: auto;
+      background-color: #001924;
+      border: 1px solid #004;
+      padding: 10px;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+  <h2>Polygon Arbitrage Interface</h2>
+  <button onclick="connectWallet()">Connect MetaMask</button>
+  <div>Wallet: <span id="wallet">Not connected</span></div>
+  <div>USDC Balance: <span id="balance">-</span></div>
+
+  <label>Trade Amount (USDC):</label>
+  <input type="number" id="amountIn" value="10" min="0.001" max="100000" step="0.001" />
+
+  <label>Minimum Profit (USDC):</label>
+  <input type="number" id="minProfit" value="0.1" min="0.0001" step="0.0001" />
+
+  <label>Scan Interval (Seconds):</label>
+  <input type="number" id="scanInterval" value="10" min="1" max="60" step="1" />
+
+  <label>Slippage (%):</label>
+  <input type="number" id="slippage" value="0.5" min="0" step="0.1" />
+
+  <label>Manual Gas Limit:</label>
+  <input type="number" id="gasLimit" value="500000" min="100000" step="10000" />
+
+  <input type="checkbox" id="onlyIfProfitable" checked /> Trade only if profitable
+
+  <button onclick="startTrading()" id="startBtn">Start Trading</button>
+  <button onclick="stopTrading()" id="stopBtn" disabled>Stop Trading</button>
+
+  <div class="large-display" id="arbDisplay">Awaiting scan...</div>
+
+  <div class="log">
+    <h4>Execution Log</h4>
+    <table id="logTable">
+      <tr><th>Time</th><th>Token</th><th>Buy/Sell DEX</th><th>Profit ($)</th><th>%</th><th>Status</th><th>Tx</th></tr>
+    </table>
+  </div>
+
+  <div class="log">
+    <h4>Event Emissions</h4>
+    <div id="emissions"></div>
+  </div>
+
+  <script>
+    const TOKENS = [
+      { symbol: "USDC", address: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", decimals: 6 },
+      { symbol: "WETH", address: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", decimals: 18 },
+      { symbol: "WBTC", address: "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6", decimals: 8 },
+      { symbol: "AAVE", address: "0xD6DF932A45C0f255f85145f286eA0b292B21C90B", decimals: 18 }
+    ];
+
+    const ROUTERS = {
+      quickswap: "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff",
+      sushiswap: "0x1b02da8cb0d097eb8d57a175b88c7d8b47997506",
+      dfyn: "0xA102072A4C07F06EC3B4900FDC4C7B80b6c57429"
+    };
+
+    let provider, signer, contract, user, trading = false, interval;
+    const CONTRACT_ADDRESS = "0x98BD86aDa64DC52E60392a43050fad5E9cAcb62F";
+    const CONTRACT_ABI = [ /* your ABI remains unchanged, as above */ ];
+
+    async function connectWallet() {
+      provider = new ethers.providers.Web3Provider(window.ethereum);
+      await provider.send("eth_requestAccounts", []);
+      signer = provider.getSigner();
+      user = await signer.getAddress();
+      document.getElementById("wallet").textContent = user;
+      contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+      updateBalance();
+    }
+
+    async function updateBalance() {
+      const usdc = new ethers.Contract(TOKENS[0].address, ["function balanceOf(address) view returns (uint256)"], provider);
+      const bal = await usdc.balanceOf(user);
+      document.getElementById("balance").textContent = (bal / 1e6).toFixed(2);
+    }
+
+    function startTrading() {
+      trading = true;
+      document.getElementById("startBtn").disabled = true;
+      document.getElementById("stopBtn").disabled = false;
+      const speed = parseInt(document.getElementById("scanInterval").value) * 1000;
+      interval = setInterval(scanArbitrage, speed);
+    }
+
+    function stopTrading() {
+      trading = false;
+      clearInterval(interval);
+      document.getElementById("startBtn").disabled = false;
+      document.getElementById("stopBtn").disabled = true;
+    }
+
+    async function ensureApproval(tokenAddress, spender, amount) {
+      const token = new ethers.Contract(tokenAddress, [
+        "function approve(address spender, uint amount) external returns (bool)",
+        "function allowance(address owner, address spender) view returns (uint)"
+      ], signer);
+
+      const currentAllowance = await token.allowance(user, spender);
+      if (currentAllowance.lt(amount)) {
+        console.log(`🔁 Approving ${ethers.utils.formatUnits(amount, 6)} USDC to contract...`);
+        const tx = await token.approve(spender, amount);
+        await tx.wait();
+        console.log(`✅ Approved`);
+      } else {
+        console.log(`✅ Already approved`);
+      }
+    }
+
+    async function scanArbitrage() {
+      const amountIn = parseFloat(document.getElementById("amountIn").value);
+      const minProfit = parseFloat(document.getElementById("minProfit").value);
+      const onlyIfProfitable = document.getElementById("onlyIfProfitable").checked;
+      const slippage = parseFloat(document.getElementById("slippage").value);
+      const gasLimit = parseInt(document.getElementById("gasLimit").value);
+
+      for (let token of TOKENS.slice(1)) {
+        for (let buy in ROUTERS) {
+          for (let sell in ROUTERS) {
+            if (buy === sell) continue;
+            try {
+              const amountInParsed = ethers.utils.parseUnits(amountIn.toString(), TOKENS[0].decimals);
+              const minProfitParsed = ethers.utils.parseUnits(minProfit.toString(), TOKENS[0].decimals);
+
+              const estProfit = await contract.callStatic.executeArbitrage(
+                ROUTERS[buy], ROUTERS[sell], TOKENS[0].address, token.address, amountInParsed, minProfitParsed
+              );
+
+              const realProfit = parseFloat(ethers.utils.formatUnits(estProfit.sub(amountInParsed), TOKENS[0].decimals));
+              const pct = (realProfit / amountIn) * 100;
+              const time = new Date().toLocaleTimeString();
+
+              const row = `<tr><td>${time}</td><td>${token.symbol}</td><td>${buy}→${sell}</td><td>$${realProfit.toFixed(4)}</td><td>${pct.toFixed(2)}%</td>`;
+
+              document.getElementById("arbDisplay").textContent = `✅ ${token.symbol}: $${realProfit.toFixed(4)} via ${buy}→${sell}`;
+              document.getElementById("arbDisplay").className = "large-display profitable";
+
+              if (!onlyIfProfitable || realProfit >= minProfit) {
+                await ensureApproval(TOKENS[0].address, CONTRACT_ADDRESS, amountInParsed);
+                const tx = await contract.executeArbitrage(
+                  ROUTERS[buy], ROUTERS[sell], TOKENS[0].address, token.address, amountInParsed, minProfitParsed,
+                  { gasLimit: gasLimit }
+                );
+                const receipt = await tx.wait(1);
+                document.getElementById("logTable").innerHTML += row + `<td>✅ Success</td><td><a href='https://polygonscan.com/tx/${receipt.transactionHash}' target='_blank'>${receipt.transactionHash.slice(0, 10)}...</a></td></tr>`;
+                document.getElementById("emissions").innerHTML += `[${time}] ✅ ArbitrageExecuted for ${token.symbol} profit: $${realProfit.toFixed(4)}<br>`;
+                updateBalance();
+              }
+            } catch (err) {
+              const time = new Date().toLocaleTimeString();
+              document.getElementById("emissions").innerHTML += `[${time}] ❌ ${buy}→${sell} reverted: ${err.message.split("\n")[0]}<br>`;
+            }
+          }
+        }
+      }
+    }
+  </script>
+</body>
+</html>
